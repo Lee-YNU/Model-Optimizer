@@ -15,7 +15,9 @@
 
 from functools import partial
 
+import pytest
 import torch
+import torch.nn as nn
 from _test_utils.torch.megatron.models import get_mcore_gpt_model
 from _test_utils.torch.megatron.utils import run_mcore_inference_with_dummy_input
 from _test_utils.torch.misc import set_seed
@@ -23,9 +25,11 @@ from _test_utils.torch.misc import set_seed
 import modelopt.torch.distill as mtd
 from modelopt.torch.distill.plugins.megatron import (
     DistillationConfig,
+    _mtp_excluded_from_quantization,
     adjust_distillation_model_for_mcore,
     setup_distillation_config,
 )
+from modelopt.torch.quantization.nn import TensorQuantizer
 
 SEED = 1234
 
@@ -212,8 +216,8 @@ def _test_topk_logits_kl_loss(top_k, rank, size):
     loss["kd_loss"].backward()
 
 
-def _test_skip_lm_loss_with_mtp(rank, size):
-    """Test that skip_lm_loss only zeroes the main LM head and not MTP heads."""
+def _test_skip_lm_loss_with_mtp(quantized, skip_lm_loss, rank, size):
+    """Test that skip_lm_loss only zeroes the main LM head, unless MTP is left out of quantization."""
     set_seed(SEED)
 
     num_layers = 2
@@ -255,9 +259,12 @@ def _test_skip_lm_loss_with_mtp(rank, size):
         activation_func="squared_relu",
         mtp_num_layers=mtp_num_layers,
     ).cuda()
+    if quantized:
+        # A quantized body with the MTP head left out of quantization.
+        student_model.decoder.weight_quantizer = TensorQuantizer()
 
     distill_cfg = setup_distillation_config(
-        config_or_path=DistillationConfig(skip_lm_loss=True),
+        config_or_path=DistillationConfig(skip_lm_loss=skip_lm_loss),
         student_cfg=student_model.config,
         teacher_cfg=teacher_model.config,
     )
@@ -268,6 +275,13 @@ def _test_skip_lm_loss_with_mtp(rank, size):
     }
     distillation_model = mtd.convert(student_model, mode=[("kd_loss", kd_config)])
     adjust_distillation_model_for_mcore(distillation_model, distill_cfg)
+
+    # An untrained MTP head is frozen so DDP doesn't wait for its grads.
+    mtp_skipped = quantized and skip_lm_loss
+    with distillation_model.hide_teacher_model():
+        mtp_params = [p for n, p in distillation_model.named_parameters() if "mtp" in n.split(".")]
+    assert mtp_params
+    assert all(p.requires_grad != mtp_skipped for p in mtp_params)
 
     # Intercept each call to compute_language_model_loss and record return values.
     recorded_losses = []
@@ -301,8 +315,8 @@ def _test_skip_lm_loss_with_mtp(rank, size):
         f"Expected {mtp_num_layers + 1} loss calls, got {len(recorded_losses)}"
     )
     for i, loss in enumerate(recorded_losses[:-1]):
-        assert loss.any(), f"MTP head {i} loss should be non-zero with skip_lm_loss=True"
-    assert not recorded_losses[-1].any(), "Main LM head loss should be zero with skip_lm_loss=True"
+        assert loss.any() != mtp_skipped, f"MTP head {i} loss should be zero iff MTP is skipped"
+    assert recorded_losses[-1].any() != skip_lm_loss, "Main LM head loss is zero iff skip_lm_loss"
 
 
 def test_logits_kl_loss(dist_workers):
@@ -315,6 +329,44 @@ def test_topk_logits_kl_loss(dist_workers, top_k: int = 5):
     dist_workers.run(partial(_test_topk_logits_kl_loss, top_k))
 
 
-def test_skip_lm_loss_with_mtp(dist_workers):
-    """Test that skip_lm_loss only zeroes the main LM head, not MTP heads."""
-    dist_workers.run(_test_skip_lm_loss_with_mtp)
+@pytest.mark.parametrize(
+    ("quantized", "skip_lm_loss"), [(False, True), (True, True), (True, False)]
+)
+def test_skip_lm_loss_with_mtp(dist_workers, quantized, skip_lm_loss):
+    """Test that skip_lm_loss only zeroes the main LM head, unless MTP is left out of quantization."""
+    dist_workers.run(partial(_test_skip_lm_loss_with_mtp, quantized, skip_lm_loss))
+
+
+def test_mtp_excluded_from_quantization():
+    """MTP loss is skipped only when the model is quantized and MTP is left out of it."""
+
+    def _quantizer(enabled: bool) -> TensorQuantizer:
+        quantizer = TensorQuantizer()
+        if not enabled:
+            quantizer.disable()
+        return quantizer
+
+    def _model(*, with_mtp: bool, body_quant: bool, mtp_quant: bool) -> nn.Module:
+        model = nn.Module()
+        model.decoder = nn.Module()
+        if body_quant:
+            model.decoder.weight_quantizer = _quantizer(True)
+        if with_mtp:
+            model.mtp = nn.Module()
+            model.mtp.weight_quantizer = _quantizer(mtp_quant)
+        return model
+
+    # Plain distillation (e.g. pruning recovery) still trains the MTP head.
+    assert not _mtp_excluded_from_quantization(
+        _model(with_mtp=True, body_quant=False, mtp_quant=False)
+    )
+    # QAD with MTP excluded from the recipe: no quantization error to recover there.
+    assert _mtp_excluded_from_quantization(_model(with_mtp=True, body_quant=True, mtp_quant=False))
+    # QAD with a quantized MTP head: keep its loss.
+    assert not _mtp_excluded_from_quantization(
+        _model(with_mtp=True, body_quant=True, mtp_quant=True)
+    )
+    # No MTP at all.
+    assert not _mtp_excluded_from_quantization(
+        _model(with_mtp=False, body_quant=True, mtp_quant=False)
+    )
